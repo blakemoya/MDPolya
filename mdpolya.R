@@ -3,6 +3,9 @@
 #  to polya
 
 require(Rcpp)
+require(parallel)
+require(dirichletprocess)
+require(abind)
 require(pracma)
 require(ggplot2)
 
@@ -35,15 +38,67 @@ mdp <- function(data, k, alpha = 1, mu = 21, tau = 25, s = 4, S = 2,
   return(out)
 }
 
-polya <- function(obj, epsilon) {
-  stopifnot(any(class(obj) == 'mdp'))
-  out <- list(phi = NULL, eta = obj$eta, args = obj$args);
-  out$phi <- polyaurn_cpp(obj, epsilon)
-  sapply(1:length(out$phi), function(i)
+polya <- function(res_mdp, epsilon = 0.01, upsilon = 0.01,
+                  nthreads = 1) {
+  UseMethod('polya')
+}
+
+polya.mdp <- function(res_mdp, epsilon = 0.01, upsilon = 0.01,
+                      nthreads = 1) {
+  stopifnot(any(class(res_mdp) == 'mdp') &
+              epsilon > 0 & epsilon < 1 &
+              upsilon > 0 & upsilon < 1)
+  out <- list(phi = NULL, eta = res_mdp$eta, args = res_mdp$args);
+  out$phi <- polyaurn_cpp(res_mdp[[1]], res_mdp[[2]], epsilon, upsilon, nthreads)
+  sapply(1:length(out$phi), function(i) {
+    out$phi[[i]] <<- out$phi[[i]][is.finite(out$phi[[i]][, 2]), , drop = FALSE];
+    if (!is.matrix(out$phi[[i]])) { # This may be unnecessary no due to drop
+      out$phi[[i]] <<- matrix(out$phi[[i]], nrow = 1)
+    }
     colnames(out$phi[[i]]) <<- c('w', 'mean', 'var')
-    )
+    })
   class(out) <- c('mdpolya_result', 'polya')
   return(out)
+}
+
+polya.dirichletprocess <- function(dp, epsilon = 0.01, upsilon = 0.01,
+                                   nthreads = 1) {
+  phi <- polyaurngen_cpp(t(sapply(dp$labelsChain, identity)),
+                         dp$alphaChain, epsilon, upsilon, nthreads)
+  sapply(1:length(phi), function(i) {
+    phi[[i]] <<- phi[[i]][is.finite(phi[[i]][, 2]), ];
+    if (!is.matrix(phi[[i]])) {
+      phi[[i]] <<- matrix(phi[[i]], nrow = 1)
+    }
+    colnames(phi[[i]]) <<- c('w', 'z')
+    phi[[i]][, 'z'] <<- phi[[i]][, 'z'] + 1
+    # phi[[i]] <<- phi[[i]][order(phi[[i]][, 'z']), ]
+  })
+  dp$weightsChain <- lapply(phi, function(p) p[, 'w'])
+  dp$clusterParametersChain <- lapply(1:length(phi), function(i) {
+    ns <- phi[[i]][, 'z'] > max(dp$labelsChain[[i]])
+    if(sum(ns) != 0) {
+      pars <- dirichletprocess::PriorDraw(dp$mixingDistribution, sum(ns))
+    } else {
+      pars <- list(array(dim = c(0, 0, 0)))
+    }
+    out <- lapply(1:length(dp$clusterParametersChain[[i]]), function(j) {
+      if (!all(!ns)) {
+        if (prod(dim(pars[[j]])) != 0) {
+          abind::abind(dp$clusterParametersChain[[i]][[j]][, ,
+                                                           phi[[i]][, 'z'][!ns],
+                                                           drop = FALSE],
+                       pars[[j]])
+        } else {
+          dp$clusterParametersChain[[i]][[j]][, , which(!ns),drop = FALSE]
+        }
+      } else {
+        dp$clusterParametersChain[[i]][[j]][, , which(!ns),drop = FALSE]
+      }
+    })
+    return(out)
+  })
+  return(dp)
 }
 
 print.mdp_result <- function(obj) {
@@ -91,11 +146,13 @@ print.mdpolya_result <- function(obj) {
   cat('\n')
 }
 
-gridify <- function(obj, grd = NULL, func = 'density') {
+gridify <- function(obj, grd = NULL, func = 'density',
+                    nthreads = 1) {
   UseMethod('gridify')
 }
 
-gridify.mdpolya_result <- function(obj, grd = NULL, func = 'density') {
+gridify.mdpolya_result <- function(obj, grd = NULL, func = 'density',
+                                   nthreads = 1) {
   if (func == 'distribution') {
     f <- 0
   } else if (func == 'density') {
@@ -110,7 +167,7 @@ gridify.mdpolya_result <- function(obj, grd = NULL, func = 'density') {
     rr_x <- diff(r_x) / 10
     grd <- seq(r_x[1] - rr_x, r_x[2] + rr_x, length = 1000)
   }
-  out <- evalmdpolya_cpp(obj$phi, grd, f)
+  out <- evalmdpolya_cpp(obj$phi, grd, f, nthreads)
   attr(out, 'func') <- func
   attr(out, 'grid') <- grd
   attr(out, 'args') <- obj$args
@@ -122,11 +179,23 @@ gridify.mdpolya_result <- function(obj, grd = NULL, func = 'density') {
   attr(obj, name)
 }
 
-plot.mdpolya_result <- function(obj, grd = NULL, func = 'density') {
-  plot(gridify(obj, grd, func))
+`[.mdpolya_result_gridded` <- function(obj, i) {
+  out <- matrix(obj, dim(obj))[i, ]
+  class(out) <- class(obj)
+  attr(out, 'func') <- attr(obj, 'func')
+  attr(out, 'grid') <- attr(obj, 'grid')
+  attr(out, 'args') <- attr(obj, 'args')
+  attr(out, 'args')$k <- length(i)
+  return(out)
 }
 
-plot.mdpolya_result_gridded <- function(obj, ...) {
+plot.mdpolya_result <- function(obj, grd = NULL, func = 'density',
+                                confint = NULL,
+                                nthreads = 1) {
+  plot(gridify(obj, grd, func, nthreads), confint)
+}
+
+plot.mdpolya_result_gridded <- function(obj, confint = NULL, ...) {
   grd <- obj$grid
   df <- data.frame(Value = rep(grd, each = nrow(obj)),
                    K = rep(1:nrow(obj), length(grd)),
@@ -138,15 +207,38 @@ plot.mdpolya_result_gridded <- function(obj, ...) {
               aes(group = 0),
               color = 'red') +
     theme_bw()
+  data <- sort(obj$args$data)
+  n <- length(data)
   if(obj$func == 'density') {
-    n <- length(obj$args$data)
-    p <- p + geom_line(data = data.frame(Value = rep(obj$args$data, 2),
-                                         X = rep(c(0, 1 / n), each = n),
-                                         K = rep(1:n, 2)),
-                       alpha = 0.5)
+    p <- p + geom_point(data = data.frame(Value = data +
+                                            runif(n, -0.001, 0.001),
+                                          X = runif(n, -max(df$X) / 50, 0),
+                                          K = 0),
+                       shape = 16, size = 0.5, alpha = 0.5)
   } else if (obj$func == 'distribution') {
-    p <- p + geom_function(fun = ecdf(obj$args$data),
-                           aes(group = 0))
+    e_cdf <- ecdf(data)
+    p <- p + stat_function(fun = e_cdf, aes(group = 0), geom = 'step', n = 1001)
+    if (!is.null(confint)) {
+      err_int <- 1 - confint
+      eps_dkw <- sqrt(log(2 / err_int) / (2 * n))
+      upper_dkw <- stepfun(data, c(0, pmin(e_cdf(data) + eps_dkw, 1)))
+      lower_dkw <- stepfun(data, c(0, pmax(e_cdf(data) - eps_dkw, 0)))
+      eps_clt <- qnorm(1 - (err_int / 2)) *
+        sqrt(e_cdf(data) * (1 - e_cdf(data)) / n)
+      upper_clt <- stepfun(data, c(0, e_cdf(data) + eps_clt))
+      lower_clt <- stepfun(data, c(0, e_cdf(data) - eps_clt))
+      p <- p +
+        stat_function(fun = upper_clt, aes(group = 0), geom = 'step', n = 1001,
+                      size = 0.25, alpha = 0.5) +
+        stat_function(fun = lower_clt, aes(group = 0), geom = 'step', n = 1001,
+                      size = 0.25, alpha = 0.5) +
+        stat_function(fun = lower_dkw, aes(group = 0), geom = 'step', n = 1001,
+                      size = 0.25, color = 'grey50', linetype = 'longdash',
+                      alpha = 0.5) +
+        stat_function(fun = upper_dkw, aes(group = 0), geom = 'step', n = 1001,
+                      size = 0.25, color = 'grey50', linetype = 'longdash',
+                      alpha = 0.5)
+    }
   }
   return(p)
 }
@@ -163,3 +255,23 @@ modes.mdpolya_result_gridded <- function(obj, grd = NULL) {
   return(apply(obj, 1, function(p) obj$grid[pracma::findpeaks(p)[, 2]]))
 }
 
+moments <- function(obj, mom, cntrl = TRUE, grd = NULL) {
+  UseMethod('moments')
+}
+
+moments.mdpolya_result <- function(obj, mom, cntrl = TRUE, grd = NULL) {
+  moments(gridify(obj, grd = grd), mom = mom, cntrl = cntrl)
+}
+
+moments.mdpolya_result_gridded <- function(obj, mom, cntrl = TRUE, grd = NULL) {
+  if (obj$func != 'density') {
+    stop('`obj` is not a density evaluation, regridify the `mdpolya_result`.')
+  }
+  x <- obj$grid
+  x_cntr <- x
+  if (cntrl & (mom != 1)) {
+    x_cntr <- obj$grid - apply(obj, 1, function(f)
+      pracma::trapz(obj$grid, obj$grid * f))
+  }
+  return(apply(obj, 1, function(f) pracma::trapz(x, x_cntr ^ mom * f)))
+}

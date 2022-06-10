@@ -1,8 +1,14 @@
 #include <RcppArmadillo.h>
 #include <RcppArmadilloExtensions/sample.h>
 #include <math.h>
+#include <boost/math/distributions.hpp>
 // [[Rcpp::plugins(cpp11)]]
 // [[Rcpp::depends(RcppArmadillo)]]
+// [[Rcpp::depends(BH)]]
+#if defined(_OPENMP)
+  #include <omp.h>
+  // [[Rcpp::plugins(openmp)]]
+#endif
 
 using namespace arma;
 
@@ -108,22 +114,35 @@ Rcpp::List mdp_cpp(vec y, uword k,
 }
 
 // [[Rcpp::export]]
-Rcpp::List polyaurn_cpp(Rcpp::List mdp_res, double eps) {
-  Rcpp::List out;
-  cube theta = mdp_res[0];
-  mat hyper = mdp_res[1];
+Rcpp::List polyaurn_cpp(cube theta, mat hyper, double eps, double ups,
+                        uword nthreads) {
   uword k = hyper.n_rows;
   uword n = theta.n_cols;
+  std::vector<mat> out(k);
+  #if defined(_OPENMP)
+    #pragma omp parallel for num_threads(nthreads)
+  #endif
   for (uword kk = 0; kk < k; kk++) {
     double alpha = hyper(kk, 0);
-    uword m = 1.0 + R::qpois(0.95, -(alpha + n) * std::log(eps), true, false);
+    uword m = 1.0 + R::qpois(1 - ups, -(alpha + n) * std::log(eps),
+                             true, false);
     mat phi(m, 3, fill::zeros);
-    vec v = Rcpp::rbeta(m, 1, alpha + n);
+    vec v(m);
+    for (uword mm = 0; mm < m; mm++) {
+      v(mm) = R::rbeta(1, alpha + n);
+    }
     phi.col(0) = v;
     v = cumprod(1 - v);
-    for (uword mm = 0; mm < m; mm++) {
+    rowvec phi_ex(3, fill::zeros);
+    phi = join_cols(phi, phi_ex);
+    uvec z_track(n, fill::value(m + 1));
+    for (uword mm = 0; mm <= m; mm++) {
       if (mm > 0) {
-        phi(mm, 0) *= v(mm - 1);
+        if (mm == m) {
+          phi(mm, 0) = 1.0 - sum(phi.col(0));
+        } else {
+          phi(mm, 0) *= v(mm - 1);
+        }
       }
       double u = R::runif(0, 1) * (alpha + n);
       if (u <= alpha) {
@@ -132,18 +151,84 @@ Rcpp::List polyaurn_cpp(Rcpp::List mdp_res, double eps) {
       } else {
         int i = std::floor(R::runif(0, 1) * n);
         int z = theta(kk, i, 0) - 1;
-        phi(mm, 1) = theta(kk, z, 1);
-        phi(mm, 2) = theta(kk, z, 2);
+        if (z_track(z) > m) {
+          phi(mm, 1) = theta(kk, z, 1);
+          phi(mm, 2) = theta(kk, z, 2);
+          z_track(z) = mm;
+        } else {
+          uword mmm = z_track(z);
+          phi(mmm, 0) += phi(mm, 0);
+          phi(mm, 0) = 0.0;
+          phi(mm, 1) = datum::nan;
+          phi(mm, 2) = datum::nan;
+        }
       }
     }
-    rowvec phi_ex(3);
-    phi_ex(0) = 1.0 - sum(phi.col(0));
-    phi_ex(1) = R::rnorm(hyper(kk, 1), std::sqrt(hyper(kk, 2)));
-    phi_ex(2) = R::rgamma(hyper(kk, 3) / 2.0, 2.0 / hyper(kk, 4));
-    phi = join_cols(phi, phi_ex);
-    out.push_back(phi);
+    out[kk] = phi;
   }
-  return out;
+  Rcpp::List out_;
+  for (uword kk = 0; kk < k; kk++) {
+    out_.push_back(out[kk]);
+  }
+  return out_;
+}
+
+// [[Rcpp::export]]
+Rcpp::List polyaurngen_cpp(umat theta, vec alpha, double eps, double ups,
+                           uword nthreads) {
+  uword k = theta.n_rows;
+  uword n = theta.n_cols;
+  std::vector<mat> out(k);
+  #if defined(_OPENMP)
+    #pragma omp parallel for num_threads(nthreads)
+  #endif
+  for (uword kk = 0; kk < k; kk++) {
+    uword m = 1.0 + R::qpois(1 - ups, -(alpha(kk) + n) * std::log(eps),
+                             true, false);
+    vec v(m);
+    mat phi(m, 2, fill::zeros);
+    for (uword mm = 0; mm < m; mm++) {
+      v(mm) = R::rbeta(1, alpha(kk) + n);
+    }
+    phi.col(0) = v;
+    v = cumprod(1 - v);
+    rowvec phi_ex(2, fill::zeros);
+    phi = join_cols(phi, phi_ex);
+    uword z_max = max(theta.row(kk));
+    uvec z_track(z_max, fill::value(m + 1));
+    for (uword mm = 0; mm <= m; mm++) {
+      if (mm > 0) {
+        if (mm == m) {
+          phi(mm, 0) = 1.0 - sum(phi.col(0));
+        } else {
+          phi(mm, 0) *= v(mm - 1);
+        }
+      }
+      double u = R::runif(0, 1) * (alpha(kk) + n);
+      if (u <= alpha(kk)) {
+        phi(mm, 1) = z_max;
+        z_max++;
+      } else {
+        int i = std::floor(R::runif(0, 1) * n);
+        int z = theta(kk, i) - 1;
+        if (z_track(z) > m) {
+          phi(mm, 1) = z;
+          z_track(z) = mm;
+        } else {
+          uword mmm = z_track(z);
+          phi(mmm, 0) += phi(mm, 0);
+          phi(mm, 0) = 0.0;
+          phi(mm, 1) = datum::nan;
+        }
+      }
+    }
+    out[kk] = phi;
+  }
+  Rcpp::List out_;
+  for (uword kk = 0; kk < k; kk++) {
+    out_.push_back(out[kk]);
+  }
+  return out_;
 }
 
 double grad(double x, double mean, double var) {
@@ -156,12 +241,15 @@ double hess(double x, double mean, double var) {
 }
 
 // [[Rcpp::export]]
-mat evalmdpolya_cpp(Rcpp::List mdpolya, vec x, int f) {
+mat evalmdpolya_cpp(Rcpp::List &mdpolya, vec &x, uword f, uword nthreads) {
   mat out(mdpolya.length(), x.n_elem, fill::zeros);
+  #if defined(_OPENMP)
+    #pragma omp parallel for num_threads(nthreads)
+  #endif
   for (uword kk = 0; kk < mdpolya.length(); kk++) {
     mat thetak = mdpolya[kk];
-    for (uword zz = 0; zz < thetak.n_rows; zz++) {
-      for (uword xx = 0; xx < x.n_elem; xx++) {
+    for (uword xx = 0; xx < x.n_elem; xx++) {
+      for (uword zz = 0; zz < thetak.n_rows; zz++) {
         if (f == 0) {
           out(kk, xx) += thetak(zz, 0) * R::pnorm(x(xx), thetak(zz, 1),
               std::sqrt(thetak(zz, 2)), true, false);
