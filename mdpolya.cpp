@@ -7,7 +7,7 @@
 // [[Rcpp::depends(BH)]]
 #if defined(_OPENMP)
   #include <omp.h>
-  // [[Rcpp::plugins(openmp)]]
+  // // [[Rcpp::plugins(openmp)]] // This causes problems on MacOS
 #endif
 
 using namespace arma;
